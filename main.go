@@ -4,20 +4,10 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strings"
-
-	"github.com/kangkyu/gauthlete"
 )
 
-var authleteClient *gauthlete.ServiceClient
-
 func main() {
-	// Initialize Authlete client
-	authleteClient = gauthlete.NewServiceClient()
-
 	mux := http.NewServeMux()
-
-	// Protected route with authentication middleware
 	mux.HandleFunc("/", validateToken(homeHandler))
 
 	log.Println("Starting backend server on :8082")
@@ -26,32 +16,55 @@ func main() {
 
 func validateToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get token from Authorization header
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			http.Error(w, "No token provided", http.StatusUnauthorized)
 			return
 		}
 
-		// Remove "Bearer " prefix
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// Validate token using Authlete
-		resp, err := authleteClient.TokenIntrospect(token)
+		// Call auth server's introspection endpoint
+		req, err := http.NewRequest("POST", "http://localhost:8080/introspect", nil)
 		if err != nil {
+			http.Error(w, "Server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Forward the same Authorization header
+		req.Header.Set("Authorization", authHeader)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Error calling introspection: %v", err)
+			http.Error(w, "Failed to validate token", http.StatusUnauthorized)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Introspection returned status: %d", resp.StatusCode)
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
 			return
 		}
 
-		if !resp.Usable {
-			http.Error(w, "Token not usable", http.StatusUnauthorized)
+		var introspectionResp struct {
+			Usable  bool     `json:"usable"`
+			Subject string   `json:"subject"`
+			Scopes  []string `json:"scopes"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&introspectionResp); err != nil {
+			log.Printf("Error decoding introspection response: %v", err)
+			http.Error(w, "Server error", http.StatusInternalServerError)
 			return
 		}
 
-		// Add user info to request context if needed
-		// ctx := context.WithValue(r.Context(), "subject", resp.Subject)
-		// next(w, r.WithContext(ctx))
+		if !introspectionResp.Usable {
+			http.Error(w, "Token not active", http.StatusUnauthorized)
+			return
+		}
 
+		log.Printf("Token validated successfully for subject: %s", introspectionResp.Subject)
 		next(w, r)
 	}
 }
@@ -61,7 +74,6 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		"message": "Welcome to Protected Backend API Server",
 		"status":  "authenticated",
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
